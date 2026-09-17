@@ -35,7 +35,7 @@ public class PeerFxApp extends Application {
 
     @Override
     public void start(Stage stage) {
-        serverIpField = new TextField("127.0.0.1");
+        serverIpField = new TextField("nhập ip server");
         usernameField = new TextField();
         peerPortField = new TextField("6001");
         messageField = new TextField();

@@ -23,7 +23,7 @@ import java.util.function.Consumer;
  */
 public class PeerNetwork {
 
-    private static final int BUFFER_SIZE = 8 * 1024;
+    private static final int BUFFER_SIZE = 8 * 1024;   
     private static final int DISCOVERY_PORT = 2005;
 
     private String username;
@@ -43,26 +43,36 @@ public class PeerNetwork {
     private final Object fileLock = new Object();
     private volatile String pendingAcceptFile;
     private volatile boolean fileAccepted;
-
+ 
+    // Các callback để báo UI thông tin.    
+    // onMessage: tin nhắn chat/file.
+    // onStatus: trạng thái kết nối, thông báo lỗi.
+    // onPeerList: danh sách peer hiện có.
+    // onFileReceived: khi nhận được file từ peer khác.
     private Consumer<String> onMessage = s -> {};
     private Consumer<String> onStatus = s -> {};
     private Consumer<List<String>> onPeerList = list -> {};
     private Consumer<File> onFileReceived = f -> {};
 
-    public void setOnMessage(Consumer<String> cb) {
-        this.onMessage = cb != null ? cb : s -> {};
+    // Các setter để đặt các callback (callback pattern).
+    // messageHandler: hàm xử lý tin nhắn chat/file.
+    // statusHandler: hàm xử lý trạng thái kết nối, thông báo lỗi.
+    // peerListHandler: hàm xử lý danh sách peer hiện có.
+    // fileReceivedHandler: hàm xử lý khi nhận được file từ peer khác.
+    public void setOnMessage(Consumer<String> messageHandler) {
+        this.onMessage = messageHandler != null ? messageHandler : message -> {};
     }
 
-    public void setOnStatus(Consumer<String> cb) {
-        this.onStatus = cb != null ? cb : s -> {};
+    public void setOnStatus(Consumer<String> statusHandler) {
+        this.onStatus = statusHandler != null ? statusHandler : status -> {};
     }
 
-    public void setOnPeerList(Consumer<List<String>> cb) {
-        this.onPeerList = cb != null ? cb : list -> {};
+    public void setOnPeerList(Consumer<List<String>> peerListHandler) {
+        this.onPeerList = peerListHandler != null ? peerListHandler : peers -> {};
     }
 
-    public void setOnFileReceived(Consumer<File> cb) {
-        this.onFileReceived = cb != null ? cb : f -> {};
+    public void setOnFileReceived(Consumer<File> fileReceivedHandler) {
+        this.onFileReceived = fileReceivedHandler != null ? fileReceivedHandler : file -> {};
     }
 
     public void connectDiscovery(String serverIp, String username, int peerPort) {
@@ -79,7 +89,11 @@ public class PeerNetwork {
 
                 // LẬP TRÌNH MẠNG:
                 // OutputStream: Peer -> Server. InputStream: Server -> Peer.
-                discoveryOut = new PrintWriter(discoverySocket.getOutputStream(), true);
+                // Tạo PrintWriter để gửi dữ liệu từ Peer (client) tới Discovery Server qua mạng:
+                // - discoverySocket.getOutputStream() lấy OutputStream gắn với socket TCP tới server, cho phép ghi dữ liệu (gửi đi).
+                // - Tham số 'true' bật chế độ autoFlush: mỗi lần gọi println, dữ liệu sẽ được đẩy ngay xuống mạng (không bị giữ trong bộ nhớ đệm chờ flush thủ công).
+                // => Khi gọi discoveryOut.println(...), chuỗi sẽ được gửi lập tức tới server qua socket.
+                discoveryOut = new PrintWriter(discoverySocket.getOutputStream(), true); 
                 discoveryIn = new BufferedReader(new InputStreamReader(discoverySocket.getInputStream()));
 
                 discoveryOut.println("REGISTER|" + username + "|" + peerPort);
