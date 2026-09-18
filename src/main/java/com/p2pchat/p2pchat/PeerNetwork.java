@@ -126,7 +126,12 @@ public class PeerNetwork {
                     onMessage.accept("FIND that bai: " + resp);
                     return;
                 }
-                String[] p = resp.split("\\|");
+                String[] p = resp.split("\\|"); 
+                // Nếu resp = "PEER|alice|192.168.1.10|5000" thì
+                // p[0]="PEER",
+                // p[1]="alice",
+                // p[2]="192.168.1.10",
+                // p[3]="5000".
                 setupP2p(new Socket(p[2], Integer.parseInt(p[3])));
                 startP2pReader();
                 onMessage.accept("Da ket noi P2P toi " + target);
@@ -137,10 +142,15 @@ public class PeerNetwork {
     }
 
     private synchronized void setupP2p(Socket socket) throws IOException {
+        // Nếu người dùng kết nối nhiều peer liên tiếp, mỗi lần không đóng socket cũ sẽ làm 
+        // chương trình giữ nhiều kết nối mạng còn mở, dẫn đến ứng dụng chậm hoặc treo máy.
         if (p2pSocket != null && !p2pSocket.isClosed()) {
             try { p2pSocket.close(); } catch (IOException ignored) {}
         }
         p2pSocket = socket;
+        // Mỗi kết nối P2P có 2 luồng: gửi (p2pOut) và nhận (p2pIn).
+        // Để đảm bảo độ tin cậy và tốc độ, sử dụng BufferedOutputStream/InputStream.
+        // Đọc/ghi theo khối (buffer) để tránh việc thực hiện hàng trăm/nghìn lần read/write byte.
         p2pOut = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         p2pIn = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
     }
@@ -158,7 +168,8 @@ public class PeerNetwork {
         t.setDaemon(true);
         t.start();
     }
-
+//"MESSAGE|username|noidung", 
+// "FILE_REQUEST|username|filename|size".
     private void handleP2p(String header) throws IOException {
         String[] p = header.split("\\|", -1);
         switch (p[0]) {
