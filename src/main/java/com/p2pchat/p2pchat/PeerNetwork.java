@@ -74,18 +74,28 @@ public class PeerNetwork {
             try {
                 while (running && serverSocket != null && !serverSocket.isClosed()) {
                     String header;
+
                     synchronized (ioLock) {
                         while (inFileTransfer && running) ioLock.wait(200);
                         if (!running) break;
+
                         header = serverIn.readUTF();
                     }
+
                     dispatchServerMessage(header);
                 }
+
             } catch (IOException | InterruptedException e) {
-                if (running) onMessage.accept("Mat ket noi server: " + e.getMessage());
-                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
+                if (running) {
+                    onMessage.accept("Mat ket noi server: " + e.getMessage());
+                }
+
+                if (e instanceof InterruptedException) {
+                    Thread.currentThread().interrupt();
+                }
             }
         }, "server-reader");
+
         t.setDaemon(true);
         t.start();
     }
