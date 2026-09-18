@@ -1,16 +1,6 @@
 package com.p2pchat.p2pchat;
 
-import java.io.BufferedInputStream;
-import java.io.BufferedOutputStream;
-import java.io.BufferedReader;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
-import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.io.*;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.util.ArrayList;
@@ -18,16 +8,17 @@ import java.util.List;
 import java.util.function.Consumer;
 
 /**
- * Toàn bộ lập trình mạng của Peer (Discovery + P2P chat/file).
- * Không đụng JavaFX — báo UI qua callback.
+ * Peer client: Discovery (đăng ký/tìm) + P2P chat + P2P file.
+ * Hai chức năng chính: gửi/nhận tin (MESSAGE) và gửi/nhận file (FILE_*).
  */
 public class PeerNetwork {
 
-    private static final int BUFFER_SIZE = 8 * 1024;   
+    private static final int BUFFER = 8 * 1024;
     private static final int DISCOVERY_PORT = 2005;
 
     private String username;
     private int peerPort;
+    private volatile boolean running = true;
 
     private Socket discoverySocket;
     private PrintWriter discoveryOut;
@@ -38,168 +29,107 @@ public class PeerNetwork {
     private DataInputStream p2pIn;
     private ServerSocket peerServer;
 
-    private volatile boolean running = true;
-
+    // Đồng bộ FILE_REQUEST ↔ FILE_ACCEPT giữa thread gửi và p2p-reader
     private final Object fileLock = new Object();
-    private volatile String pendingAcceptFile;
     private volatile boolean fileAccepted;
- 
-    // Các callback để báo UI thông tin.    
-    // onMessage: tin nhắn chat/file.
-    // onStatus: trạng thái kết nối, thông báo lỗi.
-    // onPeerList: danh sách peer hiện có.
-    // onFileReceived: khi nhận được file từ peer khác.
+
     private Consumer<String> onMessage = s -> {};
-    private Consumer<String> onStatus = s -> {};
     private Consumer<List<String>> onPeerList = list -> {};
     private Consumer<File> onFileReceived = f -> {};
 
-    // Các setter để đặt các callback (callback pattern).
-    // messageHandler: hàm xử lý tin nhắn chat/file.
-    // statusHandler: hàm xử lý trạng thái kết nối, thông báo lỗi.
-    // peerListHandler: hàm xử lý danh sách peer hiện có.
-    // fileReceivedHandler: hàm xử lý khi nhận được file từ peer khác.
-    public void setOnMessage(Consumer<String> messageHandler) {
-        this.onMessage = messageHandler != null ? messageHandler : message -> {};
+    public void setOnMessage(Consumer<String> h) {
+        onMessage = h != null ? h : s -> {};
     }
 
-    public void setOnStatus(Consumer<String> statusHandler) {
-        this.onStatus = statusHandler != null ? statusHandler : status -> {};
+    public void setOnPeerList(Consumer<List<String>> h) {
+        onPeerList = h != null ? h : list -> {};
     }
 
-    public void setOnPeerList(Consumer<List<String>> peerListHandler) {
-        this.onPeerList = peerListHandler != null ? peerListHandler : peers -> {};
+    public void setOnFileReceived(Consumer<File> h) {
+        onFileReceived = h != null ? h : f -> {};
     }
 
-    public void setOnFileReceived(Consumer<File> fileReceivedHandler) {
-        this.onFileReceived = fileReceivedHandler != null ? fileReceivedHandler : file -> {};
-    }
-
+    /** Kết nối Discovery :2005 → REGISTER → mở ServerSocket P2P → LIST. */
     public void connectDiscovery(String serverIp, String username, int peerPort) {
         this.username = username;
         this.peerPort = peerPort;
-
-        // LẬP TRÌNH MẠNG:
-        // Socket / readLine là blocking — chạy background thread, không chặn UI.
         new Thread(() -> {
             try {
-                // LẬP TRÌNH MẠNG:
-                // Socket TCP tới Discovery Server (ip + port 2005).
                 discoverySocket = new Socket(serverIp, DISCOVERY_PORT);
-
-                // LẬP TRÌNH MẠNG:
-                // OutputStream: Peer -> Server. InputStream: Server -> Peer.
-                // Tạo PrintWriter để gửi dữ liệu từ Peer (client) tới Discovery Server qua mạng:
-                // - discoverySocket.getOutputStream() lấy OutputStream gắn với socket TCP tới server, cho phép ghi dữ liệu (gửi đi).
-                // - Tham số 'true' bật chế độ autoFlush: mỗi lần gọi println, dữ liệu sẽ được đẩy ngay xuống mạng (không bị giữ trong bộ nhớ đệm chờ flush thủ công).
-                // => Khi gọi discoveryOut.println(...), chuỗi sẽ được gửi lập tức tới server qua socket.
-                discoveryOut = new PrintWriter(discoverySocket.getOutputStream(), true); 
+                discoveryOut = new PrintWriter(discoverySocket.getOutputStream(), true);
                 discoveryIn = new BufferedReader(new InputStreamReader(discoverySocket.getInputStream()));
 
                 discoveryOut.println("REGISTER|" + username + "|" + peerPort);
-                // LẬP TRÌNH MẠNG:
-                // readLine() chờ một dòng phản hồi từ Server (blocking).
-                String resp = discoveryIn.readLine();
-                onStatus.accept("Discovery: " + resp);
-                onMessage.accept("REGISTER -> " + resp);
+                onMessage.accept("REGISTER -> " + discoveryIn.readLine());
 
                 startPeerServer();
-                refreshPeerListInternal();
+                refreshPeerList();
             } catch (IOException e) {
-                onStatus.accept("Loi: " + e.getMessage());
+                onMessage.accept("Loi Discovery: " + e.getMessage());
             }
-        }, "discovery-connect").start();
+        }, "discovery").start();
     }
 
+    /** Lắng nghe peer khác connect tới (P2P). */
     private void startPeerServer() {
-        Thread acceptThread = new Thread(() -> {
+        Thread t = new Thread(() -> {
             try {
-                // LẬP TRÌNH MẠNG:
-                // ServerSocket mở TCP peerPort trên Peer này.
-                // Peer khác dùng IPv4 + port này để kết nối trực tiếp (P2P).
                 peerServer = new ServerSocket(peerPort);
                 onMessage.accept("Lang nghe P2P port " + peerPort);
-
                 while (running) {
-                    // LẬP TRÌNH MẠNG:
-                    // accept() chờ Peer khác kết nối — blocking call.
-                    // Chạy thread riêng để không chặn thread khác.
-                    Socket incoming = peerServer.accept();
-                    setupP2p(incoming);
+                    setupP2p(peerServer.accept());
                     startP2pReader();
-                    onMessage.accept("Peer ket noi toi tu " + incoming.getInetAddress().getHostAddress());
                 }
             } catch (IOException e) {
-                if (running) {
-                    onMessage.accept("Loi ServerSocket: " + e.getMessage());
-                }
+                if (running) onMessage.accept("Loi ServerSocket: " + e.getMessage());
             }
         }, "p2p-accept");
-        acceptThread.setDaemon(true);
-        acceptThread.start();
+        t.setDaemon(true);
+        t.start();
     }
 
     public void refreshPeerList() {
-        new Thread(this::refreshPeerListInternal, "list").start();
-    }
-
-    private void refreshPeerListInternal() {
-        try {
-            String resp;
-            synchronized (this) {
-                if (discoveryOut == null) {
-                    return;
-                }
-                discoveryOut.println("LIST");
-                // LẬP TRÌNH MẠNG:
-                // Đọc phản hồi LIST từ Discovery Server.
-                resp = discoveryIn.readLine();
-            }
-
-            List<String> names = new ArrayList<>();
-            if (resp != null && resp.startsWith("LIST") && !resp.equals("LIST|EMPTY")) {
-                String[] parts = resp.split("\\|", -1);
-                for (int i = 1; i < parts.length; i++) {
-                    String entry = parts[i];
-                    if (entry.contains("@")) {
-                        String name = entry.substring(0, entry.indexOf('@'));
-                        if (!name.equals(username)) {
-                            names.add(name);
-                        }
-                    }
-                }
-            }
-            onPeerList.accept(names);
-            onMessage.accept("LIST -> " + resp);
-        } catch (IOException e) {
-            onMessage.accept("LIST loi: " + e.getMessage());
-        }
-    }
-
-    public void connectPeer(String targetUsername) {
         new Thread(() -> {
             try {
                 String resp;
                 synchronized (this) {
-                    discoveryOut.println("FIND|" + targetUsername);
+                    if (discoveryOut == null) return;
+                    discoveryOut.println("LIST");
                     resp = discoveryIn.readLine();
                 }
-                onMessage.accept("FIND -> " + resp);
+                List<String> names = new ArrayList<>();
+                if (resp != null && resp.startsWith("LIST") && !resp.equals("LIST|EMPTY")) {
+                    for (String entry : resp.split("\\|")) {
+                        if (entry.contains("@")) {
+                            String name = entry.substring(0, entry.indexOf('@'));
+                            if (!name.equals(username)) names.add(name);
+                        }
+                    }
+                }
+                onPeerList.accept(names);
+            } catch (IOException e) {
+                onMessage.accept("LIST loi: " + e.getMessage());
+            }
+        }, "list").start();
+    }
+
+    /** FIND qua Discovery rồi TCP trực tiếp tới peer. */
+    public void connectPeer(String target) {
+        new Thread(() -> {
+            try {
+                String resp;
+                synchronized (this) {
+                    discoveryOut.println("FIND|" + target);
+                    resp = discoveryIn.readLine();
+                }
                 if (resp == null || !resp.startsWith("PEER|")) {
+                    onMessage.accept("FIND that bai: " + resp);
                     return;
                 }
-                String[] p = resp.split("\\|", -1);
-                String ip = p[2];
-                int port = Integer.parseInt(p[3]);
-
-                // LẬP TRÌNH MẠNG:
-                // Tạo kết nối TCP trực tiếp tới Peer đích.
-                // ip = máy đích, port = ServerSocket đang lắng nghe trên máy đó.
-                // Discovery Server không tham gia chat/file sau bước này.
-                Socket socket = new Socket(ip, port);
-                setupP2p(socket);
+                String[] p = resp.split("\\|");
+                setupP2p(new Socket(p[2], Integer.parseInt(p[3])));
                 startP2pReader();
-                onMessage.accept("Da ket noi P2P toi " + targetUsername);
+                onMessage.accept("Da ket noi P2P toi " + target);
             } catch (IOException e) {
                 onMessage.accept("Connect Peer loi: " + e.getMessage());
             }
@@ -208,79 +138,54 @@ public class PeerNetwork {
 
     private synchronized void setupP2p(Socket socket) throws IOException {
         if (p2pSocket != null && !p2pSocket.isClosed()) {
-            try {
-                p2pSocket.close();
-            } catch (IOException ignored) {
-            }
+            try { p2pSocket.close(); } catch (IOException ignored) {}
         }
         p2pSocket = socket;
-
-        // LẬP TRÌNH MẠNG:
-        // DataOutputStream/DataInputStream: writeUTF/readUTF cho text, write/read cho file.
         p2pOut = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
         p2pIn = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
     }
 
     private void startP2pReader() {
-        Thread reader = new Thread(() -> {
+        Thread t = new Thread(() -> {
             try {
                 while (running && p2pSocket != null && !p2pSocket.isClosed()) {
-                    // LẬP TRÌNH MẠNG:
-                    // readUTF() chờ dữ liệu từ Peer — blocking, phải ở background thread.
-                    String header = p2pIn.readUTF();
-                    handleP2p(header);
+                    handleP2p(p2pIn.readUTF());
                 }
             } catch (IOException e) {
-                if (running) {
-                    onMessage.accept("P2P ngat: " + e.getMessage());
-                }
+                if (running) onMessage.accept("P2P ngat: " + e.getMessage());
             }
         }, "p2p-reader");
-        reader.setDaemon(true);
-        reader.start();
+        t.setDaemon(true);
+        t.start();
     }
 
     private void handleP2p(String header) throws IOException {
-        String[] parts = header.split("\\|", -1);
-        switch (parts[0]) {
-            case "MESSAGE" -> {
-                String sender = parts.length > 1 ? parts[1] : "?";
-                String content = parts.length > 2 ? parts[2] : "";
-                onMessage.accept("[" + sender + "]: " + content);
-            }
+        String[] p = header.split("\\|", -1);
+        switch (p[0]) {
+            case "MESSAGE" -> onMessage.accept("[" + p[1] + "]: " + p[2]);
             case "FILE_REQUEST" -> {
-                String sender = parts[1];
-                String filename = parts[2];
-                long size = Long.parseLong(parts[3]);
-                onMessage.accept(sender + " gui file: " + filename + " (" + size + " B)");
-
-                // LẬP TRÌNH MẠNG:
-                // writeUTF gửi FILE_ACCEPT; flush đẩy buffer xuống socket ngay.
-                p2pOut.writeUTF("FILE_ACCEPT|" + filename);
+                // Tự ACCEPT rồi đọc đúng size byte
+                onMessage.accept(p[1] + " gui file: " + p[2] + " (" + p[3] + " B)");
+                p2pOut.writeUTF("FILE_ACCEPT|" + p[2]);
                 p2pOut.flush();
-                receiveFile(filename, size);
+                receiveFile(p[2], Long.parseLong(p[3]));
             }
             case "FILE_ACCEPT" -> {
-                String fname = parts.length > 1 ? parts[1] : "";
-                notifyFileAccept(fname);
-                onMessage.accept("Peer chap nhan file: " + fname);
+                synchronized (fileLock) {
+                    fileAccepted = true;
+                    fileLock.notifyAll();
+                }
             }
-            case "FILE_REJECT" -> onMessage.accept(
-                    "Peer tu choi file: " + (parts.length > 1 ? parts[1] : ""));
             default -> onMessage.accept("P2P: " + header);
         }
     }
 
+    // ===== Chức năng 1: gửi / nhận tin nhắn =====
+
     public void sendMessage(String content) {
         new Thread(() -> {
             try {
-                if (p2pOut == null) {
-                    onMessage.accept("Chua ket noi P2P");
-                    return;
-                }
-                // LẬP TRÌNH MẠNG:
-                // writeUTF gửi MESSAGE trực tiếp Peer → Peer qua TCP.
-                // flush() đẩy dữ liệu trong buffer xuống mạng.
+                if (p2pOut == null) { onMessage.accept("Chua ket noi P2P"); return; }
                 p2pOut.writeUTF("MESSAGE|" + username + "|" + content);
                 p2pOut.flush();
                 onMessage.accept("[Me]: " + content);
@@ -290,106 +195,66 @@ public class PeerNetwork {
         }, "send-msg").start();
     }
 
+    // ===== Chức năng 2: gửi / nhận file =====
+
     public void sendFile(File file) {
         new Thread(() -> {
             try {
-                if (p2pOut == null) {
-                    onMessage.accept("Chua ket noi P2P");
-                    return;
-                }
+                if (p2pOut == null) { onMessage.accept("Chua ket noi P2P"); return; }
+
+                fileAccepted = false;
                 p2pOut.writeUTF("FILE_REQUEST|" + username + "|" + file.getName() + "|" + file.length());
                 p2pOut.flush();
-                waitForFileAccept(file.getName());
+
+                // Chờ FILE_ACCEPT (tối đa 30s)
+                synchronized (fileLock) {
+                    long end = System.currentTimeMillis() + 30_000;
+                    while (!fileAccepted && System.currentTimeMillis() < end) {
+                        fileLock.wait(1000);
+                    }
+                }
                 if (!fileAccepted) {
                     onMessage.accept("Khong nhan duoc FILE_ACCEPT");
                     return;
                 }
-                streamFileBytes(file);
+
+                // Stream byte thô từng 8KB
+                try (FileInputStream fis = new FileInputStream(file)) {
+                    byte[] buf = new byte[BUFFER];
+                    int n;
+                    while ((n = fis.read(buf)) != -1) p2pOut.write(buf, 0, n);
+                    p2pOut.flush();
+                }
                 onMessage.accept("Da gui file: " + file.getName());
-            } catch (IOException e) {
+            } catch (IOException | InterruptedException e) {
                 onMessage.accept("Gui file loi: " + e.getMessage());
+                if (e instanceof InterruptedException) Thread.currentThread().interrupt();
             }
         }, "send-file").start();
     }
 
-    private void waitForFileAccept(String filename) {
-        synchronized (fileLock) {
-            pendingAcceptFile = filename;
-            fileAccepted = false;
-            long deadline = System.currentTimeMillis() + 30_000;
-            while (!fileAccepted && System.currentTimeMillis() < deadline) {
-                try {
-                    fileLock.wait(1000);
-                } catch (InterruptedException e) {
-                    Thread.currentThread().interrupt();
-                    return;
-                }
-            }
-            pendingAcceptFile = null;
-        }
-    }
-
-    private void notifyFileAccept(String filename) {
-        synchronized (fileLock) {
-            if (filename.equals(pendingAcceptFile)) {
-                fileAccepted = true;
-                fileLock.notifyAll();
-            }
-        }
-    }
-
-    private void streamFileBytes(File file) throws IOException {
-        // LẬP TRÌNH MẠNG:
-        // Không dùng Files.readAllBytes() — file lớn sẽ đầy RAM.
-        // Đọc/ghi từng buffer 8 KB qua TCP.
-        try (FileInputStream fis = new FileInputStream(file)) {
-            byte[] buffer = new byte[BUFFER_SIZE];
-            int n;
-            while ((n = fis.read(buffer)) != -1) {
-                // LẬP TRÌNH MẠNG:
-                // write() gửi n byte thô qua TCP tới Peer nhận.
-                p2pOut.write(buffer, 0, n);
-            }
-            p2pOut.flush();
-        }
-    }
-
     private void receiveFile(String filename, long size) throws IOException {
-        File outFile = new File("received_" + filename);
-        try (FileOutputStream fos = new FileOutputStream(outFile)) {
-            byte[] buffer = new byte[BUFFER_SIZE];
-            long remaining = size;
-            while (remaining > 0) {
-                int toRead = (int) Math.min(buffer.length, remaining);
-                // LẬP TRÌNH MẠNG:
-                // read() đọc byte từ TCP — blocking cho tới khi có dữ liệu hoặc đóng kết nối.
-                int n = p2pIn.read(buffer, 0, toRead);
-                if (n == -1) {
-                    throw new IOException("Ket noi dong som");
-                }
-                fos.write(buffer, 0, n);
-                remaining -= n;
+        File out = new File("received_" + filename);
+        try (FileOutputStream fos = new FileOutputStream(out)) {
+            byte[] buf = new byte[BUFFER];
+            long left = size;
+            while (left > 0) {
+                int n = p2pIn.read(buf, 0, (int) Math.min(buf.length, left));
+                if (n == -1) throw new IOException("Ket noi dong som");
+                fos.write(buf, 0, n);
+                left -= n;
             }
         }
-        onFileReceived.accept(outFile);
+        onFileReceived.accept(out);
     }
 
     public void shutdown() {
         running = false;
         try {
-            if (discoveryOut != null && username != null) {
-                discoveryOut.println("LOGOUT|" + username);
-            }
-            if (p2pSocket != null) {
-                p2pSocket.close();
-            }
-            if (peerServer != null) {
-                peerServer.close();
-            }
-            if (discoverySocket != null) {
-                discoverySocket.close();
-            }
-        } catch (IOException ignored) {
-        }
+            if (discoveryOut != null && username != null) discoveryOut.println("LOGOUT|" + username);
+            if (p2pSocket != null) p2pSocket.close();
+            if (peerServer != null) peerServer.close();
+            if (discoverySocket != null) discoverySocket.close();
+        } catch (IOException ignored) {}
     }
 }

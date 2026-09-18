@@ -4,82 +4,86 @@ import javafx.application.Application;
 import javafx.application.Platform;
 import javafx.geometry.Insets;
 import javafx.scene.Scene;
-import javafx.scene.control.Button;
-import javafx.scene.control.Label;
-import javafx.scene.control.ListView;
-import javafx.scene.control.TextArea;
-import javafx.scene.control.TextField;
-import javafx.scene.layout.BorderPane;
-import javafx.scene.layout.HBox;
-import javafx.scene.layout.VBox;
+import javafx.scene.control.*;
+import javafx.scene.layout.*;
 import javafx.stage.FileChooser;
 import javafx.stage.Stage;
 
-import java.io.File;
-
 /**
- * JavaFX UI only — mọi Socket/ServerSocket/stream nằm trong PeerNetwork.
+ * UI JavaFX — mạng nằm trong PeerNetwork (chat + file).
  */
 public class PeerFxApp extends Application {
 
-    private TextField serverIpField;
-    private TextField usernameField;
-    private TextField peerPortField;
-    private TextArea chatArea;
-    private TextField messageField;
-    private ListView<String> peerList;
-    private Label statusLabel;
-    private Label fileLabel;
-
     private final PeerNetwork network = new PeerNetwork();
+    private TextArea chatArea;
+    private ListView<String> peerList;
+    private Label fileLabel;
 
     @Override
     public void start(Stage stage) {
-        serverIpField = new TextField("nhập ip server");
-        usernameField = new TextField();
-        peerPortField = new TextField("6001");
-        messageField = new TextField();
+        TextField serverIp = new TextField("127.0.0.1");
+        TextField username = new TextField();
+        TextField peerPort = new TextField("6001");
+        TextField messageField = new TextField();
         chatArea = new TextArea();
         chatArea.setEditable(false);
         peerList = new ListView<>();
-        statusLabel = new Label("Chua ket noi Discovery Server");
         fileLabel = new Label("File: (chua nhan)");
 
-        // Callback từ network thread → cập nhật UI trên JavaFX Application Thread.
-        // Platform.runLater: không được sửa control JavaFX từ thread mạng.
-        network.setOnMessage(msg -> Platform.runLater(() -> appendChat(msg)));
-        network.setOnStatus(s -> Platform.runLater(() -> statusLabel.setText(s)));
+        // Thread mạng → cập nhật UI phải qua Platform.runLater
+        network.setOnMessage(msg -> Platform.runLater(() -> chatArea.appendText(msg + "\n")));
         network.setOnPeerList(list -> Platform.runLater(() -> peerList.getItems().setAll(list)));
         network.setOnFileReceived(f -> Platform.runLater(() -> {
-            appendChat("Nhan file: " + f.getAbsolutePath());
+            chatArea.appendText("Nhan file: " + f.getAbsolutePath() + "\n");
             fileLabel.setText("File: " + f.getAbsolutePath());
         }));
 
         Button connectBtn = new Button("Connect");
-        connectBtn.setOnAction(e -> connectDiscovery());
+        connectBtn.setOnAction(e -> {
+            try {
+                int port = Integer.parseInt(peerPort.getText().trim());
+                String user = username.getText().trim();
+                if (user.isEmpty()) { chatArea.appendText("Nhap username\n"); return; }
+                network.connectDiscovery(serverIp.getText().trim(), user, port);
+            } catch (NumberFormatException ex) {
+                chatArea.appendText("Peer port khong hop le\n");
+            }
+        });
 
         Button refreshBtn = new Button("Refresh LIST");
         refreshBtn.setOnAction(e -> network.refreshPeerList());
 
         Button connectPeerBtn = new Button("Connect Peer");
-        connectPeerBtn.setOnAction(e -> connectSelectedPeer());
+        connectPeerBtn.setOnAction(e -> {
+            String target = peerList.getSelectionModel().getSelectedItem();
+            if (target == null) chatArea.appendText("Chon mot peer\n");
+            else network.connectPeer(target);
+        });
 
         Button sendBtn = new Button("Send");
-        sendBtn.setOnAction(e -> sendChat());
+        sendBtn.setOnAction(e -> {
+            String text = messageField.getText();
+            if (!text.isEmpty()) {
+                messageField.clear();
+                network.sendMessage(text);
+            }
+        });
 
         Button sendFileBtn = new Button("Send File");
-        sendFileBtn.setOnAction(e -> chooseAndSendFile(stage));
+        sendFileBtn.setOnAction(e -> {
+            var file = new FileChooser().showOpenDialog(stage);
+            if (file != null) network.sendFile(file);
+        });
 
         HBox top = new HBox(8,
-                new Label("Server IP"), serverIpField,
-                new Label("User"), usernameField,
-                new Label("Peer Port"), peerPortField,
-                connectBtn);
+                new Label("Server IP"), serverIp,
+                new Label("User"), username,
+                new Label("Port"), peerPort, connectBtn);
         top.setPadding(new Insets(8));
 
-        VBox left = new VBox(8, new Label("Peers online"), peerList, refreshBtn, connectPeerBtn);
+        VBox left = new VBox(8, new Label("Peers"), peerList, refreshBtn, connectPeerBtn);
         left.setPadding(new Insets(8));
-        left.setPrefWidth(220);
+        left.setPrefWidth(200);
 
         HBox bottom = new HBox(8, messageField, sendBtn, sendFileBtn);
         messageField.setPrefWidth(400);
@@ -87,65 +91,13 @@ public class PeerFxApp extends Application {
 
         VBox center = new VBox(8, chatArea, fileLabel, bottom);
         center.setPadding(new Insets(8));
-        VBox.setVgrow(chatArea, javafx.scene.layout.Priority.ALWAYS);
+        VBox.setVgrow(chatArea, Priority.ALWAYS);
 
-        BorderPane root = new BorderPane();
-        root.setTop(new VBox(top, statusLabel));
-        root.setLeft(left);
-        root.setCenter(center);
-
+        BorderPane root = new BorderPane(center, top, null, null, left);
         stage.setTitle("P2P Chat");
         stage.setScene(new Scene(root, 800, 500));
         stage.setOnCloseRequest(e -> network.shutdown());
         stage.show();
-    }
-
-    private void connectDiscovery() {
-        String username = usernameField.getText().trim();
-        String ip = serverIpField.getText().trim();
-        int peerPort;
-        try {
-            peerPort = Integer.parseInt(peerPortField.getText().trim());
-        } catch (NumberFormatException ex) {
-            appendChat("Peer port khong hop le");
-            return;
-        }
-        if (username.isEmpty()) {
-            appendChat("Nhap username");
-            return;
-        }
-        network.connectDiscovery(ip, username, peerPort);
-    }
-
-    private void connectSelectedPeer() {
-        String target = peerList.getSelectionModel().getSelectedItem();
-        if (target == null) {
-            appendChat("Chon mot peer trong danh sach");
-            return;
-        }
-        network.connectPeer(target);
-    }
-
-    private void sendChat() {
-        String content = messageField.getText();
-        if (content.isEmpty()) {
-            return;
-        }
-        messageField.clear();
-        network.sendMessage(content);
-    }
-
-    private void chooseAndSendFile(Stage stage) {
-        FileChooser chooser = new FileChooser();
-        File file = chooser.showOpenDialog(stage);
-        if (file == null) {
-            return;
-        }
-        network.sendFile(file);
-    }
-
-    private void appendChat(String line) {
-        chatArea.appendText(line + "\n");
     }
 
     public static void main(String[] args) {
